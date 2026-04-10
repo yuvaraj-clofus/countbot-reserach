@@ -1,0 +1,38 @@
+# Python cache
+*__pycache__/
+*.pyc
+
+# Model weights & exports
+*.pt
+*.pth
+*.trt
+*.engine
+*.onnx
+*.wts
+
+# Videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Images
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+*.webp
+
+# Training runs & outputs
+runs/
+training/
+steps/master-models/
+
+# Dataset folders
+frames/
+testing/models/
+testing/video/
+testing/videotesting/FastSAM/TensorRT-FastSAM/
+images/
+convert-trt/

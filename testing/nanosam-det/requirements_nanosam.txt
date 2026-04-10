@@ -1,0 +1,11 @@
+# NanoSAM Dependencies for Jetson Orin Nano
+# Install with: pip install -r requirements_nanosam.txt
+
+torch==2.0.0
+torchvision==0.15.0
+opencv-python==4.8.0.76
+numpy==1.24.3
+mobile-sam==0.1.0
+# For Jetson optimization (optional)
+# onnx>=1.14.0
+# onnxruntime-gpu  # For TensorRT acceleration
