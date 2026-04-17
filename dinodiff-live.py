@@ -40,7 +40,7 @@ def make_divisible_by(val, divisor):
 TARGET_W = make_divisible_by(640, PATCH_SIZE)  # 644
 TARGET_H = make_divisible_by(480, PATCH_SIZE)  # 476
 
-REF_FRAMES    = 30    # number of initial frames to capture as reference
+REF_FRAMES    = 40    # number of initial frames to capture as reference
 TOPK          = 3     # top-k references for similarity (reduces flicker)
 THRESH        = 0.4   # cosine-distance threshold for anomaly detection
 MIN_AREA      = 200   # minimum contour area to keep
@@ -333,6 +333,8 @@ def main():
             combined = cv2.resize(combined, (int(combined.shape[1] * scale),
                                              int(combined.shape[0] * scale)))
 
+        # Rotate 90 degrees clockwise
+        # combined = cv2.rotate(combined, cv2.ROTATE_90_CLOCKWISE)
         cv2.imshow(win_name, combined)
 
         key = cv2.waitKey(1) & 0xFF
