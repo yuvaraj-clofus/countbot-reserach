@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+python3 depthdiff-live-v4.py --rotate 90
+
 depthdiff-live-v3.py — Conveyor Object Counting with Depth-Anything V2
                        Direct depth threshold + two-line entry/exit counting.
 
@@ -21,7 +23,7 @@ Pipeline per frame:
     6. Two-line ENTRY -> EXIT counting (rejects false positives between lines)
 
 Controls:  q=quit   d=toggle debug stats   r=reset count+tracks
-           (video-file mode) space=advance one frame
+           (video-file mode) space=pause/resume
 """
 
 import argparse
@@ -93,8 +95,9 @@ def parse_args():
     parser.add_argument("--start", "-s", type=str, default=None,
                         help="Start timestamp for video files, mm:ss or hh:mm:ss "
                              "(e.g. 01:30). Ignored for live sources.")
-    parser.add_argument("--rotate", "-r", type=float, default=0.0,
-                        help="Rotate each frame by N degrees clockwise before processing.")
+    parser.add_argument("--rotate", "-r", type=float, default=90.0,
+                        help="Rotate each frame by N degrees clockwise before processing. "
+                             "Default: 90.")
     parser.add_argument("--crop", type=str, default=None,
                         help="Crop each frame BEFORE depth estimation. "
                              "Format: x1,y1,x2,y2 as percentages (0-100) or "
@@ -435,6 +438,8 @@ def main():
     compute_fps = 0.0
     loop_timer = cv2.getTickCount()
     tick_freq = cv2.getTickFrequency()
+    video_delay_ms = max(1, int(round(1000.0 / fps))) if args.video else 1
+    video_paused = False
 
     while True:
         ret, frame = cap.read()
@@ -586,15 +591,16 @@ def main():
         cv2.imshow(win_name, combined)
 
         if args.video:
-            while True:
-                key = cv2.waitKey(0) & 0xFF
-                if key in (ord(' '), ord('q'), ord('r'), ord('d')):
-                    break
+            key = cv2.waitKey(0 if video_paused else video_delay_ms) & 0xFF
         else:
             key = cv2.waitKey(1) & 0xFF
 
         if key == ord('q'):
             break
+        elif key == ord(' '):
+            if args.video:
+                video_paused = not video_paused
+                print(f"[VIDEO {'PAUSED' if video_paused else 'PLAYING'}]")
         elif key == ord('r'):
             print("[RESET] count + tracks cleared.")
             count = 0

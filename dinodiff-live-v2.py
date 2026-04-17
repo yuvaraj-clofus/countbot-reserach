@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+python3 dinodiff-live-v2.py  --rotate 90 --entry-line 30,20,30,75 --exit-l
+ine 80,20,80,75
+
 dinodiff-live-v2.py — Conveyor Object Detection using DINOv2
                        Two-line entry/exit counting to reject false positives.
 
@@ -44,7 +47,7 @@ def make_divisible_by(val, divisor):
 TARGET_W = make_divisible_by(640, PATCH_SIZE)  # 644
 TARGET_H = make_divisible_by(480, PATCH_SIZE)  # 476
 
-REF_FRAMES    = 30    # number of initial frames to capture as reference
+REF_FRAMES    = 100 # number of initial frames to capture as reference
 TOPK          = 3      # top-k references for similarity (reduces flicker)
 THRESH        = 0.4    # cosine-distance threshold for anomaly detection
 MIN_AREA      = 200    # minimum contour area to keep
@@ -83,6 +86,14 @@ def parse_args():
                         help="Path to video file. If omitted, uses the live GStreamer pipeline.")
     parser.add_argument("--rotate", "-r", type=float, default=0.0,
                         help="Rotate each frame by N degrees clockwise before processing.")
+    parser.add_argument("--entry-line", type=str, default=None,
+                        help="Entry line segment as x1,y1,x2,y2 in percentages "
+                             "(0-100) or fractions (0.0-1.0). "
+                             "Default: 30,0,30,100")
+    parser.add_argument("--exit-line", type=str, default=None,
+                        help="Exit line segment as x1,y1,x2,y2 in percentages "
+                             "(0-100) or fractions (0.0-1.0). "
+                             "Default: 80,0,80,100")
     return parser.parse_args()
 
 
@@ -109,6 +120,97 @@ def rotate_frame(frame, degrees):
     M[0, 2] += (new_w / 2.0) - center[0]
     M[1, 2] += (new_h / 2.0) - center[1]
     return cv2.warpAffine(frame, M, (new_w, new_h))
+
+
+def parse_line_segment(spec, default_x_frac):
+    """
+    Parse x1,y1,x2,y2 as either percent (0-100) or fraction (0.0-1.0).
+    Returns line endpoints as fractions in [0, 1].
+    """
+    if not spec:
+        return (default_x_frac, 0.0, default_x_frac, 1.0)
+
+    parts = [p.strip() for p in spec.split(",")]
+    if len(parts) != 4:
+        raise ValueError(f"line expects 4 comma-separated values, got {len(parts)}")
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError:
+        raise ValueError(f"line values must be numeric: {spec!r}")
+
+    if max(vals) > 1.0:
+        vals = [v / 100.0 for v in vals]
+
+    x1, y1, x2, y2 = vals
+    if not all(0.0 <= v <= 1.0 for v in vals):
+        raise ValueError(
+            f"line values out of range: x1={x1:.3f} y1={y1:.3f} "
+            f"x2={x2:.3f} y2={y2:.3f}"
+        )
+    if x1 == x2 and y1 == y2:
+        raise ValueError("line start and end cannot be the same point")
+    return (x1, y1, x2, y2)
+
+
+def line_to_pixels(line_fracs, width, height):
+    """Convert fractional line endpoints to pixel coordinates."""
+    x1f, y1f, x2f, y2f = line_fracs
+    x1 = int(round(x1f * (width - 1)))
+    y1 = int(round(y1f * (height - 1)))
+    x2 = int(round(x2f * (width - 1)))
+    y2 = int(round(y2f * (height - 1)))
+    return ((x1, y1), (x2, y2))
+
+
+def line_label_pos(line_pixels, width, height):
+    """Choose a label anchor near the line start while keeping it on-screen."""
+    (x1, y1), _ = line_pixels
+    label_x = min(max(x1 + 5, 5), max(width - 120, 5))
+    label_y = min(max(y1 + 25, 20), max(height - 10, 20))
+    return (label_x, label_y)
+
+
+def _orientation(a, b, c):
+    """Return orientation of ordered triplet (a, b, c)."""
+    val = ((b[1] - a[1]) * (c[0] - b[0])) - ((b[0] - a[0]) * (c[1] - b[1]))
+    if val > 0:
+        return 1
+    if val < 0:
+        return -1
+    return 0
+
+
+def _on_segment(a, b, c):
+    """Return True if point b lies on segment ac."""
+    return (
+        min(a[0], c[0]) <= b[0] <= max(a[0], c[0]) and
+        min(a[1], c[1]) <= b[1] <= max(a[1], c[1])
+    )
+
+
+def segments_intersect(p1, p2, q1, q2):
+    """Return True if segments p1-p2 and q1-q2 intersect."""
+    if p1 == p2:
+        return False
+
+    o1 = _orientation(p1, p2, q1)
+    o2 = _orientation(p1, p2, q2)
+    o3 = _orientation(q1, q2, p1)
+    o4 = _orientation(q1, q2, p2)
+
+    if o1 != o2 and o3 != o4:
+        return True
+
+    if o1 == 0 and _on_segment(p1, q1, p2):
+        return True
+    if o2 == 0 and _on_segment(p1, q2, p2):
+        return True
+    if o3 == 0 and _on_segment(q1, p1, q2):
+        return True
+    if o4 == 0 and _on_segment(q1, p2, q2):
+        return True
+
+    return False
 
 
 # ── Image preprocessing ─────────────────────────────────────────────────────
@@ -211,7 +313,7 @@ class CentroidTracker:
         self.disappeared = OrderedDict()   # id -> frames since last seen
         self.crossed_entry = OrderedDict() # id -> True if crossed entry line
         self.counted = OrderedDict()       # id -> True if already counted
-        self.prev_cx = OrderedDict()       # id -> previous cx (for crossing detection)
+        self.prev_pos = OrderedDict()      # id -> previous (cx, cy) for crossing detection
         self.max_dist = max_dist
         self.max_disappeared = max_disappeared
 
@@ -221,7 +323,7 @@ class CentroidTracker:
         self.disappeared.clear()
         self.crossed_entry.clear()
         self.counted.clear()
-        self.prev_cx.clear()
+        self.prev_pos.clear()
 
     def _register(self, cx, cy):
         oid = self.next_id
@@ -229,7 +331,7 @@ class CentroidTracker:
         self.disappeared[oid] = 0
         self.crossed_entry[oid] = False
         self.counted[oid] = False
-        self.prev_cx[oid] = cx
+        self.prev_pos[oid] = (cx, cy)
         self.next_id += 1
         return oid
 
@@ -238,7 +340,7 @@ class CentroidTracker:
         del self.disappeared[oid]
         del self.crossed_entry[oid]
         del self.counted[oid]
-        del self.prev_cx[oid]
+        del self.prev_pos[oid]
 
     def update(self, centroids):
         """
@@ -283,7 +385,7 @@ class CentroidTracker:
 
             oid = object_ids[row]
             cx, cy = int(input_centroids[col][0]), int(input_centroids[col][1])
-            self.prev_cx[oid] = self.objects[oid][0]
+            self.prev_pos[oid] = self.objects[oid]
             self.objects[oid] = (cx, cy)
             self.disappeared[oid] = 0
             used_rows.add(row)
@@ -305,7 +407,7 @@ class CentroidTracker:
 
         return self.objects
 
-    def check_line_crossings(self, entry_x, exit_x):
+    def check_line_crossings(self, entry_line, exit_line):
         """
         Check which tracked objects crossed the entry or exit lines this frame.
         Returns number of new counts (objects that crossed exit after entry).
@@ -313,17 +415,15 @@ class CentroidTracker:
         new_counts = 0
 
         for oid in list(self.objects.keys()):
-            cx, _ = self.objects[oid]
-            px = self.prev_cx.get(oid, cx)
+            current_pos = self.objects[oid]
+            prev_pos = self.prev_pos.get(oid, current_pos)
 
-            # Check entry line crossing (left-to-right: prev < entry <= current)
             if not self.crossed_entry[oid]:
-                if px < entry_x <= cx or cx < entry_x <= px:
+                if segments_intersect(prev_pos, current_pos, entry_line[0], entry_line[1]):
                     self.crossed_entry[oid] = True
 
-            # Check exit line crossing — only if entry was already crossed
             if self.crossed_entry[oid] and not self.counted[oid]:
-                if px < exit_x <= cx or cx < exit_x <= px:
+                if segments_intersect(prev_pos, current_pos, exit_line[0], exit_line[1]):
                     self.counted[oid] = True
                     new_counts += 1
 
@@ -335,6 +435,12 @@ class CentroidTracker:
 def main():
     args = parse_args()
     rotate_deg = args.rotate
+    try:
+        entry_line_fracs = parse_line_segment(args.entry_line, LINE_ENTRY_FRAC)
+        exit_line_fracs = parse_line_segment(args.exit_line, LINE_EXIT_FRAC)
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        return
 
     if args.video:
         cap = cv2.VideoCapture(args.video)
@@ -358,8 +464,8 @@ def main():
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     grid_h, grid_w = get_patch_grid_size()
 
-    entry_x = int(W * LINE_ENTRY_FRAC)
-    exit_x  = int(W * LINE_EXIT_FRAC)
+    entry_line = line_to_pixels(entry_line_fracs, W, H)
+    exit_line = line_to_pixels(exit_line_fracs, W, H)
 
     # ROI pixel bounds
     roi_x0 = int(ROI_LEFT * W)
@@ -372,8 +478,8 @@ def main():
     print(f"ROI   : x=[{roi_x0}, {roi_x1}]  ({roi_w}px wide)")
     print(f"DINO input : {TARGET_W}x{TARGET_H}  ->  patch grid {grid_w}x{grid_h}")
     print(f"Ref frames : {REF_FRAMES}")
-    print(f"Entry line : x={entry_x}  ({LINE_ENTRY_FRAC:.0%} of width)")
-    print(f"Exit  line : x={exit_x}  ({LINE_EXIT_FRAC:.0%} of width)")
+    print(f"Entry line : {entry_line[0]} -> {entry_line[1]}")
+    print(f"Exit  line : {exit_line[0]} -> {exit_line[1]}")
     print(f"Threshold  : {THRESH}")
 
     # ── Step 1: Capture reference frames ──────────────────────────────────────
@@ -462,13 +568,13 @@ def main():
         cv2.rectangle(display, (roi_x0, 0), (roi_x1, H), (100, 100, 100), 1)
 
         # Draw entry line (yellow) and exit line (blue)
-        cv2.line(display, (entry_x, 0), (entry_x, H), (0, 255, 255), 2)
-        cv2.line(display, (exit_x, 0), (exit_x, H), (255, 0, 0), 2)
+        cv2.line(display, entry_line[0], entry_line[1], (0, 255, 255), 2)
+        cv2.line(display, exit_line[0], exit_line[1], (255, 0, 0), 2)
 
         # Label the lines
-        cv2.putText(display, "ENTRY", (entry_x + 5, 25),
+        cv2.putText(display, "ENTRY", line_label_pos(entry_line, W, H),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.putText(display, "EXIT", (exit_x + 5, 25),
+        cv2.putText(display, "EXIT", line_label_pos(exit_line, W, H),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
         # Collect centroids from valid contours
@@ -489,7 +595,7 @@ def main():
         tracker.update(centroids)
 
         # Check line crossings and count
-        new_counts = tracker.check_line_crossings(entry_x, exit_x)
+        new_counts = tracker.check_line_crossings(entry_line, exit_line)
         count += new_counts
         if new_counts > 0:
             print(f"[COUNT {count}] +{new_counts} object(s) crossed entry->exit at frame {frame_n}")

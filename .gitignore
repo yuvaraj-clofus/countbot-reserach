@@ -36,3 +36,4 @@ testing/video/
 testing/videotesting/FastSAM/TensorRT-FastSAM/
 images/
 convert-trt/
+.codex
