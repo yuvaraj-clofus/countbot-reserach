@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-python3 dinodiff-live-v2.py  --rotate 90 --entry-line 30,20,30,75 --exit-l
+python3 dinodiff-live-v2-edit.py  --rotate 90 --entry-line 30,20,30,75 --exit-l
 ine 80,20,80,75
 
-dinodiff-live-v2.py — Conveyor Object Detection using DINOv2
+dinodiff-live-v2-edit.py — Conveyor Object Detection using DINOv2
                        Two-line entry/exit counting to reject false positives.
 
 Improvement over v1:
@@ -50,7 +50,7 @@ TARGET_H = make_divisible_by(480, PATCH_SIZE)  # 476
 
 REF_FRAMES    = 100 # number of initial frames to capture as reference
 TOPK          = 3      # top-k references for similarity (reduces flicker)
-THRESH        = 0.4    # cosine-distance threshold for anomaly detection
+THRESH        = 0.5    # cosine-distance threshold for anomaly detection
 MIN_AREA      = 200    # minimum contour area to keep
 TEMPORAL_ALPHA = 0.7   # temporal smoothing: weight for current mask vs prev
 
@@ -67,8 +67,13 @@ ROI_LEFT  = 0
 ROI_RIGHT = 1
 
 # Object snapshot settings
-OBJECTS_DIR = "objects"
+SCRIPT_DIR = Path(__file__).resolve().parent
+OBJECTS_DIR = SCRIPT_DIR / "objects"
+CONFIRMED_DIR = SCRIPT_DIR / "confirmed"
+UNCONFIRMED_DIR = SCRIPT_DIR / "unconfirmed"
 OBJECT_CROP_PADDING = 10
+OBJECT_EMBED_SIZE = 224
+OBJECT_MATCH_THRESHOLD = 0.75
 
 # Debug stats: print similarity stats every N frames
 DEBUG_STATS_EVERY = 30
@@ -234,6 +239,20 @@ def preprocess(frame_bgr):
     return tensor
 
 
+def preprocess_object_crop(crop_bgr):
+    """Resize and normalize one object crop for DINOv2 object matching."""
+    img = cv2.resize(
+        crop_bgr,
+        (OBJECT_EMBED_SIZE, OBJECT_EMBED_SIZE),
+        interpolation=cv2.INTER_AREA,
+    )
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    tensor = torch.from_numpy(img).permute(2, 0, 1).float().unsqueeze(0) / 255.0
+    tensor = tensor.to(DEVICE)
+    tensor = (tensor - MEAN) / STD
+    return tensor
+
+
 # ── Feature extraction ────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -248,6 +267,30 @@ def extract_patch_tokens(frame_bgr):
     tokens = tokens.squeeze(0)                # (N, D)
     tokens = F.normalize(tokens, dim=1)
     return tokens
+
+
+@torch.no_grad()
+def extract_object_embedding(crop_bgr):
+    """Return one normalized DINO embedding for an object crop."""
+    if crop_bgr is None or crop_bgr.size == 0:
+        return None
+
+    tensor = preprocess_object_crop(crop_bgr)
+    embedding = model(tensor)
+    return F.normalize(embedding, dim=-1).squeeze(0)
+
+
+def compare_object_embeddings(master_embedding, object_embedding):
+    """Return cosine similarity between two object embeddings."""
+    if master_embedding is None or object_embedding is None:
+        return None
+
+    score = F.cosine_similarity(
+        master_embedding.unsqueeze(0),
+        object_embedding.unsqueeze(0),
+        dim=-1,
+    )
+    return float(score.item())
 
 
 def get_patch_grid_size():
@@ -329,18 +372,45 @@ def crop_object_image(frame_bgr, bbox, padding=OBJECT_CROP_PADDING):
     return crop.copy()
 
 
-def save_object_image(frame_bgr, bbox, folder, object_index, track_id, frame_n):
-    """Save one object crop to disk and return the saved path."""
-    crop = crop_object_image(frame_bgr, bbox)
-    if crop is None:
+def object_filename(object_index, track_id, frame_n):
+    """Build a stable filename for an exited object crop."""
+    filename = f"object_{object_index:04d}_track_{track_id:04d}_frame_{frame_n:04d}.jpg"
+    return filename
+
+
+def save_crop_image(crop, folder, object_index, track_id, frame_n):
+    """Save one already-cropped object image to disk and return the saved path."""
+    if crop is None or crop.size == 0:
         return None
 
-    filename = f"object_{object_index:04d}_track_{track_id:04d}_frame_{frame_n:04d}.jpg"
+    filename = object_filename(object_index, track_id, frame_n)
     out_path = Path(folder) / filename
     ok = cv2.imwrite(str(out_path), crop)
     if not ok:
         return None
     return str(out_path)
+
+
+def save_object_image(frame_bgr, bbox, folder, object_index, track_id, frame_n):
+    """Save one object crop to disk and return the saved path."""
+    crop = crop_object_image(frame_bgr, bbox)
+    return save_crop_image(crop, folder, object_index, track_id, frame_n)
+
+
+def build_object_record(object_index, track_id, frame_n, time_sec, bbox,
+                        object_path, decision_path, similarity, decision):
+    """Build metadata for confirmed/unconfirmed object arrays."""
+    return {
+        "object_index": object_index,
+        "track_id": track_id,
+        "frame_n": frame_n,
+        "time_sec": round(float(time_sec), 4),
+        "bbox": tuple(int(v) for v in bbox) if bbox is not None else None,
+        "object_path": object_path,
+        "decision_path": decision_path,
+        "similarity": similarity,
+        "decision": decision,
+    }
 
 
 # ── Simple centroid tracker ───────────────────────────────────────────────────
@@ -547,7 +617,12 @@ def main():
     ref_bank = build_reference_bank(ref_rois)
     print(f"[REF] Bank ready: {ref_bank.shape}  (patches x refs x dim)\n")
     ensure_output_dir(OBJECTS_DIR)
+    ensure_output_dir(CONFIRMED_DIR)
+    ensure_output_dir(UNCONFIRMED_DIR)
     print(f"[SAVE] Object crops will be stored in: {Path(OBJECTS_DIR).resolve()}")
+    print(f"[SAVE] Confirmed crops will be stored in: {Path(CONFIRMED_DIR).resolve()}")
+    print(f"[SAVE] Unconfirmed crops will be stored in: {Path(UNCONFIRMED_DIR).resolve()}")
+    print(f"[MATCH] First saved object becomes master. Threshold={OBJECT_MATCH_THRESHOLD:.2f}")
 
     # ── Threshold slider ──────────────────────────────────────────────────────
     win_name = "DINOv2 Anomaly Detection v2"
@@ -563,6 +638,12 @@ def main():
     tracker = CentroidTracker()
     count = 0
     saved_object_count = 0
+    master_object = None
+    master_embedding = None
+    all_objects = []
+    confirmed_objects = []
+    unconfirmed_objects = []
+    object_decisions = {}  # oid -> "confirmed" | "unconfirmed"
     debug_mode = False
     prev_mask = None
     frame_n = 0
@@ -660,28 +741,84 @@ def main():
 
         for oid in new_count_ids:
             bbox = tracker.boxes.get(oid)
+            crop = crop_object_image(frame, bbox)
             saved_object_count += 1
-            saved_path = save_object_image(
-                frame_bgr=frame,
-                bbox=bbox,
+            object_path = save_crop_image(
+                crop=crop,
                 folder=OBJECTS_DIR,
                 object_index=saved_object_count,
                 track_id=oid,
                 frame_n=frame_n,
             )
-            if saved_path:
-                print(f"[SAVE {saved_object_count}] Track #{oid} stored: {saved_path}")
-            else:
+            if not object_path:
                 print(f"[SAVE ERROR] Could not store crop for track #{oid} at frame {frame_n}")
+                continue
+
+            object_embedding = extract_object_embedding(crop)
+            if object_embedding is None:
+                print(f"[MATCH ERROR] Could not embed crop for track #{oid} at frame {frame_n}")
+                continue
+
+            if master_embedding is None:
+                decision = "confirmed"
+                similarity = 1.0
+                decision_dir = CONFIRMED_DIR
+                master_embedding = object_embedding
+                print(f"[MASTER] Track #{oid} set as master object from {object_path}")
+            else:
+                similarity = compare_object_embeddings(master_embedding, object_embedding)
+                is_match = similarity is not None and similarity >= OBJECT_MATCH_THRESHOLD
+                decision = "confirmed" if is_match else "unconfirmed"
+                decision_dir = CONFIRMED_DIR if is_match else UNCONFIRMED_DIR
+
+            decision_path = save_crop_image(
+                crop=crop,
+                folder=decision_dir,
+                object_index=saved_object_count,
+                track_id=oid,
+                frame_n=frame_n,
+            )
+            if not decision_path:
+                print(f"[SAVE ERROR] Could not store {decision} crop for track #{oid} at frame {frame_n}")
+                continue
+
+            record = build_object_record(
+                object_index=saved_object_count,
+                track_id=oid,
+                frame_n=frame_n,
+                time_sec=video_sec,
+                bbox=bbox,
+                object_path=object_path,
+                decision_path=decision_path,
+                similarity=round(float(similarity), 4) if similarity is not None else None,
+                decision=decision,
+            )
+            object_decisions[oid] = decision
+            all_objects.append(record)
+            if decision == "confirmed":
+                confirmed_objects.append(record)
+                if master_object is None:
+                    master_object = record
+            else:
+                unconfirmed_objects.append(record)
+
+            print(
+                f"[SAVE {saved_object_count}] Track #{oid} object={object_path}  "
+                f"{decision}={decision_path}  score={record['similarity']:.4f}"
+            )
 
         # Draw tracked objects with IDs and state
         for oid, (cx, cy) in tracker.objects.items():
             entered = tracker.crossed_entry[oid]
             counted = tracker.counted[oid]
 
-            if counted:
-                color = (0, 200, 0)     # green — counted
-                label = f"#{oid} OK"
+            decision = object_decisions.get(oid)
+            if counted and decision == "confirmed":
+                color = (0, 200, 0)     # green — confirmed
+                label = f"#{oid} CONFIRMED"
+            elif counted and decision == "unconfirmed":
+                color = (0, 0, 220)     # red — unconfirmed
+                label = f"#{oid} UNCONFIRMED"
             elif entered:
                 color = (0, 165, 255)   # orange — entered, awaiting exit
                 label = f"#{oid} >"
@@ -718,9 +855,10 @@ def main():
         # Banner
         banner_h = 70
         banner = np.zeros((banner_h, combined.shape[1], 3), dtype=np.uint8)
-        line1 = (f"COUNT: {count}    Time: {time_str}    "
-                 f"Frame: {frame_n}    Thresh: {cur_thresh:.2f}    "
-                 f"Tracks: {len(tracker.objects)}")
+        line1 = (f"COUNT: {count}    CONFIRMED: {len(confirmed_objects)}    "
+                 f"UNCONFIRMED: {len(unconfirmed_objects)}    "
+                 f"Time: {time_str}    Frame: {frame_n}    "
+                 f"Thresh: {cur_thresh:.2f}    Tracks: {len(tracker.objects)}")
         line2 = (f"FPS  src: {fps:.1f}    compute: {compute_fps:.1f}    "
                  f"loop: {loop_fps:.1f}    "
                  f"[ENTRY=yellow  EXIT=blue]")
@@ -732,13 +870,16 @@ def main():
 
         cv2.imshow(win_name, combined)
 
-        if args.video:
+        key = cv2.waitKey(1) & 0xFF
+        if args.video and key == ord(' '):
+            # space = pause; press space again to resume
             while True:
-                key = cv2.waitKey(0) & 0xFF
-                if key in (ord(' '), ord('q'), ord('r'), ord('d')):
+                k = cv2.waitKey(0) & 0xFF
+                if k == ord(' '):
                     break
-        else:
-            key = cv2.waitKey(1) & 0xFF
+                if k in (ord('q'), ord('r'), ord('d')):
+                    key = k
+                    break
 
         if key == ord('q'):
             break
@@ -756,6 +897,12 @@ def main():
                 print(f"[REF] Bank updated: {ref_bank.shape}")
             count = 0
             tracker.reset()
+            master_object = None
+            master_embedding = None
+            all_objects.clear()
+            confirmed_objects.clear()
+            unconfirmed_objects.clear()
+            object_decisions.clear()
             prev_mask = None
         elif key == ord('d'):
             debug_mode = not debug_mode
@@ -765,6 +912,8 @@ def main():
     cv2.destroyAllWindows()
     print(f"\n{'=' * 40}")
     print(f"Final count: {count}")
+    print(f"Confirmed objects: {len(confirmed_objects)}")
+    print(f"Unconfirmed objects: {len(unconfirmed_objects)}")
     print(f"{'=' * 40}")
 
 
