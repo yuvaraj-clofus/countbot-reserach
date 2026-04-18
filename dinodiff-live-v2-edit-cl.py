@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-python3 dinodiff-live-v2-edit-cl.py --rotate 90   --entry-line 20,20,20,75 --capture-line 40,20,40,75 --exit-line 80,20,80,75
+video
+python3 dinodiff-live-v2-edit-cl.py --rotate 0   --entry-line 20,20,20,75 --capture-line 50,20,50,75 --exit-line 80,20,80,75 --video count2.mp4 
 
+live
+python3 dinodiff-live-v2-edit-cl.py --rotate 0   --entry-line 20,20,20,75 --capture-line 50,20,50,75 --exit-line 80,20,80,75
 
 Improvement over v1:
     Objects must cross the ENTRY line first, then the EXIT line to be counted.
@@ -666,10 +669,14 @@ def main():
     debug_mode = False
     prev_mask = None
     frame_n = 0
+    sim_map  = np.ones((grid_h, grid_w), dtype=np.float32)
+    diff_map = np.zeros((grid_h, grid_w), dtype=np.float32)
     loop_fps = 0.0
     compute_fps = 0.0
     loop_timer = cv2.getTickCount()
     tick_freq = cv2.getTickFrequency()
+
+    frame_clock = cv2.getTickCount()  # wall-clock at start of last processed frame
 
     while True:
         ret, frame = cap.read()
@@ -677,6 +684,16 @@ def main():
             break
         frame = rotate_frame(frame, rotate_deg)
         frame_n += 1
+
+        # Auto-skip frames to match real-time (mirrors live drop=1)
+        if args.video and fps > 0:
+            elapsed_sec = (cv2.getTickCount() - frame_clock) / tick_freq
+            frames_behind = int(elapsed_sec * fps) - 1
+            for _ in range(max(0, frames_behind)):
+                if not cap.grab():
+                    break
+                frame_n += 1
+        frame_clock = cv2.getTickCount()
 
         now = cv2.getTickCount()
         loop_fps = tick_freq / max(now - loop_timer, 1)

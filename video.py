@@ -24,7 +24,7 @@ width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
 # -------- OUTPUT FILE --------
-output_file = "output.mp4"
+output_file = "count2.mp4"
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 
 # Swap width & height because of rotation

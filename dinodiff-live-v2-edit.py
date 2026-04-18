@@ -73,7 +73,7 @@ CONFIRMED_DIR = SCRIPT_DIR / "confirmed"
 UNCONFIRMED_DIR = SCRIPT_DIR / "unconfirmed"
 OBJECT_CROP_PADDING = 10
 OBJECT_EMBED_SIZE = 224
-OBJECT_MATCH_THRESHOLD = 0.75
+OBJECT_MATCH_THRESHOLD = 0.70
 
 # Debug stats: print similarity stats every N frames
 DEBUG_STATS_EVERY = 30
@@ -652,12 +652,24 @@ def main():
     loop_timer = cv2.getTickCount()
     tick_freq = cv2.getTickFrequency()
 
+    frame_clock = cv2.getTickCount()
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         frame = rotate_frame(frame, rotate_deg)
         frame_n += 1
+
+        # Auto-skip frames to match real-time (mirrors live drop=1)
+        if args.video and fps > 0:
+            elapsed_sec = (cv2.getTickCount() - frame_clock) / tick_freq
+            frames_behind = int(elapsed_sec * fps) - 1
+            for _ in range(max(0, frames_behind)):
+                if not cap.grab():
+                    break
+                frame_n += 1
+        frame_clock = cv2.getTickCount()
 
         now = cv2.getTickCount()
         loop_fps = tick_freq / max(now - loop_timer, 1)
@@ -871,15 +883,6 @@ def main():
         cv2.imshow(win_name, combined)
 
         key = cv2.waitKey(1) & 0xFF
-        if args.video and key == ord(' '):
-            # space = pause; press space again to resume
-            while True:
-                k = cv2.waitKey(0) & 0xFF
-                if k == ord(' '):
-                    break
-                if k in (ord('q'), ord('r'), ord('d')):
-                    key = k
-                    break
 
         if key == ord('q'):
             break
