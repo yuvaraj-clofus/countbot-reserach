@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-python3 dinodiff-live-v2-edit.py  --rotate 90 --entry-line 30,20,30,75 --exit-l
-ine 80,20,80,75
+python3 dinodiff-live-v2-el.py  --rotate 90 --entry-line 30,20,30,75 --exit-line 80,20,80,75
 
-dinodiff-live-v2-edit.py — Conveyor Object Detection using DINOv2
-                       Two-line entry/exit counting to reject false positives.
+python3 dinodiff-live-v2-el.py  --rotate 0 --entry-line 30,20,30,75 --exit-line 80,20,80,75 --video count1.mp4
 
 Improvement over v1:
     Objects must cross the ENTRY line first, then the EXIT line to be counted.
@@ -27,8 +25,10 @@ import numpy as np
 # ── Config ────────────────────────────────────────────────────────────────────
 GST_PIPELINE = (
     "v4l2src device=/dev/video0 ! "
+    "image/jpeg ! "
+    "jpegdec ! "
     "videoconvert ! "
-    "video/x-raw,format=BGR,width=640,height=480 ! "
+    "video/x-raw,format=BGR ! "
     "appsink drop=1"
 )
 
@@ -567,8 +567,17 @@ def main():
         cap = cv2.VideoCapture(args.video)
         src_desc = f"file: {args.video}"
     else:
+        # Try GStreamer first, fall back to V4L2 direct
         cap = cv2.VideoCapture(GST_PIPELINE, cv2.CAP_GSTREAMER)
-        src_desc = f"live GStreamer: {GST_PIPELINE}"
+        if cap.isOpened():
+            src_desc = f"live GStreamer: {GST_PIPELINE}"
+        else:
+            cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            src_desc = "live V4L2 direct (/dev/video0)"
 
     if not cap.isOpened():
         print(f"ERROR: Cannot open source ({src_desc})")

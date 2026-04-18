@@ -43,7 +43,6 @@ while True:
     # Save rotated frame
     out.write(frame)
 
-    # Show rotated frame
     cv2.imshow("Recording", frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
